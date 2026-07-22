@@ -1,0 +1,24 @@
+[build-system]
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "fspcodec"
+version = "0.1.0"
+description = "Lossless byte-planar zstd compression for float32 2-D arrays (depth maps)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "GoldenPigeon" }]
+dependencies = ["numpy>=1.22"]
+classifiers = [
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: 3",
+  "Topic :: System :: Archiving :: Compression",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "maturin"]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]

@@ -1,0 +1,21 @@
+[package]
+name = "fspcodec"
+version = "0.1.0"
+edition = "2021"
+description = "Lossless byte-planar zstd compression for float32 2-D arrays (depth maps)"
+license = "MIT"
+repository = "https://github.com/Golden-Pigeon/fspcodec"
+
+[lib]
+name = "fspcodec"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"] }
+numpy = "0.23"
+xxhash-rust = { version = "0.8", default-features = false, features = ["xxh3"] }
+zstd = "0.13"
+
+[profile.release]
+lto = true
+codegen-units = 1
