@@ -24,6 +24,10 @@
 //!
 //! The plane transforms have SSSE3 SIMD kernels with scalar fallback
 //! (auto-detected; set FSPCODEC_NO_SIMD=1 to force scalar).
+//!
+//! Sparse records use the same magic and a version-3 header. They store
+//! delta-coded u32 pixel indices and original u32 float bits in two optional
+//! zstd blocks. The checksum covers the header and uncompressed blocks.
 
 use numpy::ndarray::Array2;
 use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
@@ -38,10 +42,30 @@ use xxhash_rust::xxh3::{xxh3_64, Xxh3};
 
 const HDR: usize = 32;
 const MAGIC: &[u8; 4] = b"FSP1";
+const DENSE_VERSION: u8 = 2;
+const SPARSE_VERSION: u8 = 3;
 /// Upper bound on H*W accepted by encode and decode. Decoding allocates
 /// roughly 7 * H * W bytes based on header fields alone, so this caps what a
 /// hostile 32-byte header can make us allocate.
 const MAX_PIXELS: usize = 1 << 31;
+
+#[derive(Clone, Copy)]
+enum Storage {
+    Auto,
+    Dense,
+    Sparse,
+}
+
+impl Storage {
+    fn parse(value: &str) -> PyResult<Self> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "dense" => Ok(Self::Dense),
+            "sparse" => Ok(Self::Sparse),
+            _ => Err(verr("storage must be 'auto', 'dense' or 'sparse'")),
+        }
+    }
+}
 
 fn verr(msg: impl Into<String>) -> PyErr {
     PyValueError::new_err(msg.into())
@@ -249,7 +273,7 @@ fn split_filter(src: &[u32], h: usize, w: usize, work: &mut [u8]) {
     }
 }
 
-fn encode(src: &[f32], h: usize, w: usize, level: i32) -> Result<Vec<u8>, String> {
+fn encode_dense(src: &[f32], h: usize, w: usize, level: i32) -> Result<Vec<u8>, String> {
     let n = h * w;
     if n == 0 {
         return Err("array must be non-empty".into());
@@ -264,7 +288,7 @@ fn encode(src: &[f32], h: usize, w: usize, level: i32) -> Result<Vec<u8>, String
     // Worst case every plane is stored raw, plus the checksum trailer.
     let mut out = vec![0u8; HDR + 4 * n + 8];
     out[..4].copy_from_slice(MAGIC);
-    out[4] = 2;
+    out[4] = DENSE_VERSION;
     out[5] = level.clamp(0, 255) as u8;
     out[8..12].copy_from_slice(&(h as u32).to_le_bytes());
     out[12..16].copy_from_slice(&(w as u32).to_le_bytes());
@@ -294,31 +318,241 @@ fn encode(src: &[f32], h: usize, w: usize, level: i32) -> Result<Vec<u8>, String
     Ok(out)
 }
 
-fn decode(buf: &[u8]) -> Result<(Vec<f32>, usize, usize), String> {
-    if buf.len() < HDR || &buf[..4] != MAGIC {
+fn encode_block(raw: &[u8], level: i32) -> (Vec<u8>, bool) {
+    if raw.is_empty() {
+        return (Vec::new(), false);
+    }
+    let mut compressed = vec![0u8; raw.len()];
+    match zstd::bulk::compress_to_buffer(raw, &mut compressed[..], level) {
+        Ok(size) if size < raw.len() => {
+            compressed.truncate(size);
+            (compressed, true)
+        }
+        _ => (raw.to_vec(), false),
+    }
+}
+
+fn encode_sparse(src: &[f32], h: usize, w: usize, level: i32) -> Result<Vec<u8>, String> {
+    let mut indices = Vec::new();
+    let mut values = Vec::new();
+    let mut previous = 0u32;
+    for (index, value) in src.iter().enumerate() {
+        let bits = value.to_bits();
+        // Only positive zero is implicit. Keep -0, infinities, subnormals and
+        // every NaN payload exactly, without floating-point arithmetic.
+        if bits != 0 {
+            let index = index as u32;
+            indices.extend_from_slice(&(index - previous).to_le_bytes());
+            values.extend_from_slice(&bits.to_le_bytes());
+            previous = index;
+        }
+    }
+    let count = indices.len() / 4;
+    let (index_blob, index_zstd) = encode_block(&indices, level);
+    let (value_blob, value_zstd) = encode_block(&values, level);
+    let index_size = u32::try_from(index_blob.len()).map_err(|_| "sparse index block too large")?;
+    let value_size = u32::try_from(value_blob.len()).map_err(|_| "sparse value block too large")?;
+    let mut header = [0u8; HDR];
+    header[..4].copy_from_slice(MAGIC);
+    header[4] = SPARSE_VERSION;
+    header[5] = level.clamp(0, 255) as u8;
+    header[6] = u8::from(index_zstd) | (u8::from(value_zstd) << 1);
+    header[8..12].copy_from_slice(&(h as u32).to_le_bytes());
+    header[12..16].copy_from_slice(&(w as u32).to_le_bytes());
+    header[16..20].copy_from_slice(&(count as u32).to_le_bytes());
+    header[20..24].copy_from_slice(&index_size.to_le_bytes());
+    header[24..28].copy_from_slice(&value_size.to_le_bytes());
+    let mut hasher = Xxh3::new();
+    hasher.update(&header);
+    hasher.update(&indices);
+    hasher.update(&values);
+    let mut out = Vec::with_capacity(HDR + index_blob.len() + value_blob.len() + 8);
+    out.extend_from_slice(&header);
+    out.extend_from_slice(&index_blob);
+    out.extend_from_slice(&value_blob);
+    out.extend_from_slice(&hasher.digest().to_le_bytes());
+    Ok(out)
+}
+
+fn encode(
+    src: &[f32],
+    h: usize,
+    w: usize,
+    level: i32,
+    storage: Storage,
+) -> Result<Vec<u8>, String> {
+    let n = h
+        .checked_mul(w)
+        .filter(|&n| n > 0 && n <= MAX_PIXELS)
+        .ok_or("invalid dimensions")?;
+    if h > u32::MAX as usize || w > u32::MAX as usize || src.len() != n {
+        return Err("array dimensions exceed format limits".into());
+    }
+    match storage {
+        Storage::Dense => encode_dense(src, h, w, level),
+        Storage::Sparse => encode_sparse(src, h, w, level),
+        Storage::Auto => {
+            // Dense v2 always stores n raw low bytes. For at most n/8 explicit
+            // values, even uncompressed sparse indices+bits cannot exceed that
+            // mandatory plane. Dense data exits this scan early; do not encode
+            // both alternatives or scan an entire dense image unnecessarily.
+            let limit = n / 8;
+            let mut count = 0usize;
+            for value in src {
+                if value.to_bits() != 0 {
+                    count += 1;
+                    if count > limit {
+                        return encode_dense(src, h, w, level);
+                    }
+                }
+            }
+            encode_sparse(src, h, w, level)
+        }
+    }
+}
+
+struct RecordLayout {
+    h: usize,
+    w: usize,
+    n: usize,
+    version: u8,
+    flags: u8,
+    count: usize,
+    sizes: [usize; 4],
+    payload: usize,
+}
+
+fn record_layout(header: &[u8]) -> Result<RecordLayout, String> {
+    if header.len() < HDR || &header[..4] != MAGIC {
         return Err("not an FSP1 blob".into());
     }
-    if buf[4] != 2 {
-        return Err(format!("unsupported FSP version {}", buf[4]));
+    let version = header[4];
+    if version != DENSE_VERSION && version != SPARSE_VERSION {
+        return Err(format!("unsupported FSP version {version}"));
     }
-    let h = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
-    let w = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
+    let h = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
+    let w = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
     let n = h
         .checked_mul(w)
         .filter(|&n| n > 0 && n <= MAX_PIXELS)
         .ok_or("invalid dimensions")?;
 
-    // Validate every plane record before allocating anything.
     let mut sizes = [0usize; 4];
-    let mut off = HDR;
-    for (i, size) in sizes.iter_mut().enumerate() {
-        let cs = u32::from_le_bytes(buf[16 + 4 * i..20 + 4 * i].try_into().unwrap()) as usize;
-        if cs > n || off + cs > buf.len() {
-            return Err("truncated or corrupt blob".into());
+    let mut count = 0usize;
+    let flags = header[6];
+    if version == DENSE_VERSION {
+        for (i, size) in sizes.iter_mut().enumerate() {
+            let cs =
+                u32::from_le_bytes(header[16 + 4 * i..20 + 4 * i].try_into().unwrap()) as usize;
+            if cs == 0 || cs > n {
+                return Err("invalid dense plane size".into());
+            }
+            *size = cs;
         }
-        *size = cs;
-        off += cs;
+        // The v2 format specifies an uncompressed b0 plane. Reject malformed
+        // fourth compressed planes before allocating its three-plane scratch.
+        if sizes[3] != n {
+            return Err("dense low-byte plane must be raw".into());
+        }
+    } else {
+        if flags & !3 != 0 || header[7] != 0 || header[28..32] != [0; 4] {
+            return Err("unsupported sparse flags or reserved fields".into());
+        }
+        count = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+        if count > n {
+            return Err("sparse count exceeds image size".into());
+        }
+        let raw_size = count.checked_mul(4).ok_or("sparse size overflow")?;
+        for (i, size) in sizes[..2].iter_mut().enumerate() {
+            let cs =
+                u32::from_le_bytes(header[20 + 4 * i..24 + 4 * i].try_into().unwrap()) as usize;
+            let compressed = flags & (1 << i) != 0;
+            if (compressed && (cs == 0 || cs >= raw_size)) || (!compressed && cs != raw_size) {
+                return Err("invalid sparse block size".into());
+            }
+            *size = cs;
+        }
     }
+    let payload = sizes
+        .iter()
+        .try_fold(8usize, |sum, &size| sum.checked_add(size))
+        .ok_or("record size overflow")?;
+    Ok(RecordLayout {
+        h,
+        w,
+        n,
+        version,
+        flags,
+        count,
+        sizes,
+        payload,
+    })
+}
+
+fn decode_sparse(buf: &[u8], layout: &RecordLayout) -> Result<(Vec<f32>, usize, usize), String> {
+    let raw_size = layout.count.checked_mul(4).ok_or("sparse size overflow")?;
+    let mut blocks = Vec::with_capacity(2);
+    let mut off = HDR;
+    for (i, &size) in layout.sizes[..2].iter().enumerate() {
+        let input = &buf[off..off + size];
+        let raw = if layout.flags & (1 << i) != 0 {
+            // Allocate only the declared, bounded output length; never allow
+            // a compressed frame to choose an unbounded decompression size.
+            let mut raw = vec![0u8; raw_size];
+            let decoded = zstd::bulk::decompress_to_buffer(input, &mut raw[..])
+                .map_err(|e| format!("zstd: {e}"))?;
+            if decoded != raw_size {
+                return Err("sparse block size mismatch".into());
+            }
+            raw
+        } else {
+            input.to_vec()
+        };
+        blocks.push(raw);
+        off += size;
+    }
+    let mut hasher = Xxh3::new();
+    hasher.update(&buf[..HDR]);
+    for block in &blocks {
+        hasher.update(block);
+    }
+    let checksum = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+    if hasher.digest() != checksum {
+        return Err("checksum mismatch (corrupt data)".into());
+    }
+    // Validate coordinates before allocating the restored image.
+    let mut previous = 0usize;
+    for (i, delta) in blocks[0].chunks_exact(4).enumerate() {
+        let delta = u32::from_le_bytes(delta.try_into().unwrap()) as usize;
+        if i > 0 && delta == 0 {
+            return Err("sparse indices must be strictly increasing".into());
+        }
+        previous = previous
+            .checked_add(delta)
+            .filter(|&index| index < layout.n)
+            .ok_or("sparse index outside image")?;
+    }
+    let mut out = vec![0f32; layout.n];
+    let mut index = 0usize;
+    for (delta, bits) in blocks[0].chunks_exact(4).zip(blocks[1].chunks_exact(4)) {
+        index += u32::from_le_bytes(delta.try_into().unwrap()) as usize;
+        out[index] = f32::from_bits(u32::from_le_bytes(bits.try_into().unwrap()));
+    }
+    Ok((out, layout.h, layout.w))
+}
+
+fn decode(buf: &[u8]) -> Result<(Vec<f32>, usize, usize), String> {
+    let layout = record_layout(buf)?;
+    let total = HDR
+        .checked_add(layout.payload)
+        .ok_or("record size overflow")?;
+    if buf.len() < total {
+        return Err("truncated or corrupt blob".into());
+    }
+    if layout.version == SPARSE_VERSION {
+        return decode_sparse(buf, &layout);
+    }
+    let RecordLayout { h, w, n, sizes, .. } = layout;
 
     let mut work = vec![0u8; 3 * n];
     let mut tmp = &mut work[..];
@@ -373,14 +607,16 @@ fn decode(buf: &[u8]) -> Result<(Vec<f32>, usize, usize), String> {
     Ok((out_f32, h, w))
 }
 
-/// Compress a float32 2-D array into an FSP1 blob.
+/// Compress a float32 2-D array, automatically selecting dense or sparse storage.
 #[pyfunction]
-#[pyo3(signature = (array, level=3))]
+#[pyo3(signature = (array, level=3, *, storage="auto"))]
 fn compress<'py>(
     py: Python<'py>,
     array: PyReadonlyArray2<'py, f32>,
     level: i32,
+    storage: &str,
 ) -> PyResult<Bound<'py, PyBytes>> {
+    let storage = Storage::parse(storage)?;
     let view = array.as_array();
     let std_layout = view.as_standard_layout();
     let (h, w) = std_layout.dim();
@@ -388,12 +624,12 @@ fn compress<'py>(
         .as_slice()
         .ok_or_else(|| verr("failed to obtain contiguous view"))?;
     let blob = py
-        .allow_threads(|| encode(src, h, w, level))
+        .allow_threads(|| encode(src, h, w, level, storage))
         .map_err(verr)?;
     Ok(PyBytes::new(py, &blob))
 }
 
-/// Decompress an FSP1 blob back into a float32 2-D array.
+/// Decompress a dense or sparse FSP1 blob back into a float32 2-D array.
 #[pyfunction]
 fn decompress<'py>(py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyArray2<f32>>> {
     let (v, h, w) = py.allow_threads(|| decode(data)).map_err(verr)?;
@@ -403,13 +639,15 @@ fn decompress<'py>(py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyArray2
 
 /// Compress `array` and write it to `path`.
 #[pyfunction]
-#[pyo3(signature = (path, array, level=3))]
+#[pyo3(signature = (path, array, level=3, *, storage="auto"))]
 fn write<'py>(
     py: Python<'py>,
     path: PathBuf,
     array: PyReadonlyArray2<'py, f32>,
     level: i32,
+    storage: &str,
 ) -> PyResult<()> {
+    let storage = Storage::parse(storage)?;
     let view = array.as_array();
     let std_layout = view.as_standard_layout();
     let (h, w) = std_layout.dim();
@@ -417,13 +655,13 @@ fn write<'py>(
         .as_slice()
         .ok_or_else(|| verr("failed to obtain contiguous view"))?;
     py.allow_threads(|| {
-        let blob = encode(src, h, w, level)?;
+        let blob = encode(src, h, w, level, storage)?;
         std::fs::write(&path, blob).map_err(|e| e.to_string())
     })
     .map_err(verr)
 }
 
-/// Read an FSP1 file and return the decoded float32 2-D array.
+/// Read a dense or sparse FSP1 file into the original float32 2-D array.
 #[pyfunction]
 fn read<'py>(py: Python<'py>, path: PathBuf) -> PyResult<Bound<'py, PyArray2<f32>>> {
     let (v, h, w) = py
@@ -464,28 +702,20 @@ fn read_next_blob(f: &mut File) -> Result<Option<Vec<u8>>, String> {
     if !read_exact_or_eof(f, &mut hdr)? {
         return Ok(None);
     }
-    if &hdr[..4] != MAGIC {
-        return Err("not an FSP1 stream".into());
-    }
-    if hdr[4] != 2 {
-        return Err(format!("unsupported FSP version {}", hdr[4]));
-    }
-    let h = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as usize;
-    let w = u32::from_le_bytes(hdr[12..16].try_into().unwrap()) as usize;
-    let n = h
-        .checked_mul(w)
-        .filter(|&n| n > 0 && n <= MAX_PIXELS)
-        .ok_or("invalid dimensions")?;
-    let mut payload = 0usize;
-    for i in 0..4 {
-        let cs = u32::from_le_bytes(hdr[16 + 4 * i..20 + 4 * i].try_into().unwrap()) as usize;
-        if cs > n {
-            return Err("truncated or corrupt blob".into());
+    let layout = record_layout(&hdr)?;
+    let total = HDR
+        .checked_add(layout.payload)
+        .ok_or("record size overflow")?;
+    // Check the remaining file length before allocating a header-sized claim.
+    let metadata = f.metadata().map_err(|e| e.to_string())?;
+    if metadata.is_file() {
+        let position = std::io::Seek::stream_position(f).map_err(|e| e.to_string())?;
+        let remaining = metadata.len().saturating_sub(position);
+        if (layout.payload as u64) > remaining {
+            return Err("truncated FSP stream".into());
         }
-        payload += cs;
     }
-    payload += 8; // checksum trailer
-    let mut blob = vec![0u8; HDR + payload];
+    let mut blob = vec![0u8; total];
     blob[..HDR].copy_from_slice(&hdr);
     if !read_exact_or_eof(f, &mut blob[HDR..])? {
         return Err("truncated FSP stream".into());
@@ -504,6 +734,7 @@ struct FspFile {
     mode: FileMode,
     path: PathBuf,
     level: i32,
+    storage: Storage,
 }
 
 impl FspFile {
@@ -536,17 +767,22 @@ impl FspFile {
 #[pymethods]
 impl FspFile {
     /// Append one float32 2-D array to the file.
-    #[pyo3(signature = (array, level=None))]
+    #[pyo3(signature = (array, level=None, *, storage=None))]
     fn write<'py>(
         &mut self,
         py: Python<'py>,
         array: PyReadonlyArray2<'py, f32>,
         level: Option<i32>,
+        storage: Option<&str>,
     ) -> PyResult<()> {
         if self.mode == FileMode::Read {
             return Err(verr("file not open for writing"));
         }
         let level = level.unwrap_or(self.level);
+        let storage = storage
+            .map(Storage::parse)
+            .transpose()?
+            .unwrap_or(self.storage);
         let view = array.as_array();
         let std_layout = view.as_standard_layout();
         let (h, w) = std_layout.dim();
@@ -558,7 +794,7 @@ impl FspFile {
             .as_mut()
             .ok_or_else(|| verr("I/O operation on closed file"))?;
         py.allow_threads(|| {
-            let blob = encode(src, h, w, level)?;
+            let blob = encode(src, h, w, level, storage)?;
             f.write_all(&blob).map_err(|e| e.to_string())
         })
         .map_err(verr)
@@ -634,8 +870,9 @@ impl FspFile {
 /// mode: "r" (read), "w" (create/truncate), "a" (append). A trailing "b" is
 /// accepted and ignored. `level` sets the default zstd level for writes.
 #[pyfunction]
-#[pyo3(signature = (path, mode="r", level=3))]
-fn open(path: PathBuf, mode: &str, level: i32) -> PyResult<FspFile> {
+#[pyo3(signature = (path, mode="r", level=3, *, storage="auto"))]
+fn open(path: PathBuf, mode: &str, level: i32, storage: &str) -> PyResult<FspFile> {
+    let storage = Storage::parse(storage)?;
     let m = match mode.trim_end_matches('b') {
         "r" => FileMode::Read,
         "w" => FileMode::Write,
@@ -653,6 +890,7 @@ fn open(path: PathBuf, mode: &str, level: i32) -> PyResult<FspFile> {
         mode: m,
         path,
         level,
+        storage,
     })
 }
 

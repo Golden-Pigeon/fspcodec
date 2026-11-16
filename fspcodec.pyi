@@ -1,11 +1,14 @@
-"""fspcodec — lossless byte-planar compression for float32 2-D arrays.
+"""fspcodec — lossless dense/sparse compression for float32 2-D arrays.
 
-Each float32 is split into its 4 bytes (byte planes); the structured planes
-are delta-filtered and zstd-compressed, the noise plane is stored raw. The
-transform is bit-exact: NaN payloads, infinities, ``-0.0`` and subnormals
-survive round-trips unchanged. Heavy work runs with the GIL released.
+Dense storage uses delta-filtered byte planes and zstd; sparse storage keeps
+pixel-index deltas and original value bits. The default selects sparse storage
+when ``8 * nnz <= H * W``, counting nonzero float32 bit patterns. NaN payloads,
+infinities, ``-0.0`` and subnormals survive bit-exactly. Heavy work runs with the
+GIL released.
 
-The container format is FSP1 (see README for the byte-level layout).
+FSP1 readers identify dense version 2 and sparse version 3 automatically.
+Writing with ``storage="dense"`` preserves compatibility with older readers;
+upgrading the library does not rewrite existing files. See README for layouts.
 """
 
 from os import PathLike
@@ -28,8 +31,14 @@ __all__ = [
 __version__: str
 
 _StrPath: TypeAlias = str | PathLike[str]
+_Storage: TypeAlias = Literal["auto", "dense", "sparse"]
 
-def compress(array: npt.NDArray[np.float32], level: int = 3) -> bytes:
+def compress(
+    array: npt.NDArray[np.float32],
+    level: int = 3,
+    *,
+    storage: _Storage = "auto",
+) -> bytes:
     """Compress a float32 2-D array into an FSP1 blob.
 
     Args:
@@ -37,12 +46,18 @@ def compress(array: npt.NDArray[np.float32], level: int = 3) -> bytes:
             transparently; other dtypes raise ``TypeError``.
         level: zstd compression level (1-22). Higher is smaller but slower;
             3 is a good speed/size default, 9 gains ~5% for slow encodes.
+        storage: ``"auto"`` uses sparse storage when ``8 * nnz <= H * W``;
+            ``nnz`` counts nonzero float32 bit patterns, including ``-0.0``.
+            ``"dense"`` forces the unchanged version-2 byte-plane encoding
+            without a sparse scan. ``"sparse"`` forces version-3 index/value
+            encoding. This argument is keyword-only.
 
     Returns:
         The FSP1 blob. Round-trips bit-exactly through :func:`decompress`.
 
     Raises:
-        ValueError: If the array is empty or exceeds 2**31 elements.
+        ValueError: If the array is empty, exceeds 2**31 elements, or the
+            storage mode is invalid.
         TypeError: If the array is not 2-D float32.
     """
 
@@ -57,31 +72,41 @@ def decompress(data: bytes) -> npt.NDArray[np.float32]:
         The decoded 2-D ``float32`` array, bit-exact to the original.
 
     Note:
-        An XXH3-64 checksum over all plane data is verified before returning.
-        Decoding allocates roughly ``7 * H * W`` bytes based on header fields
-        (capped at 2**31 elements), so still apply an external size check
-        before decoding untrusted blobs.
+        Dense version 2 and sparse version 3 are identified from the header.
+        The XXH3-64 checksum covers dense plane data, or the sparse header and
+        decoded index/value segments. Decoding allocates a dense result plus
+        format-dependent temporary buffers from header fields (capped at
+        2**31 elements); apply size checks before decoding untrusted blobs.
 
     Raises:
         ValueError: If the blob is truncated, corrupt, fails the checksum,
             or is not FSP1.
     """
 
-def write(path: _StrPath, array: npt.NDArray[np.float32], level: int = 3) -> None:
+def write(
+    path: _StrPath,
+    array: npt.NDArray[np.float32],
+    level: int = 3,
+    *,
+    storage: _Storage = "auto",
+) -> None:
     """Compress ``array`` and write a single-array FSP1 file to ``path``.
 
-    Equivalent to ``open(path, "w", level).write(array)`` for one array.
+    Equivalent to ``open(path, "w", level, storage=storage).write(array)``
+    for one array. ``storage`` is keyword-only and accepts ``"auto"``,
+    ``"dense"`` or ``"sparse"`` with the same meaning as :func:`compress`.
 
     Raises:
-        ValueError: On encoding failure or I/O errors.
+        ValueError: On encoding failure, invalid storage mode, or I/O errors.
         TypeError: If the array is not 2-D float32.
     """
 
 def read(path: _StrPath) -> npt.NDArray[np.float32]:
     """Read an FSP1 file and return the (first) decoded array.
 
-    For multi-array stream files written via :func:`open`, only the first
-    array is returned; use :func:`open` to iterate over all of them.
+    Dense version 2 and sparse version 3 are identified automatically. For
+    multi-array stream files written via :func:`open`, only the first array
+    is returned; use :func:`open` to iterate over all of them.
 
     Raises:
         ValueError: If the file is missing, truncated, or not FSP1.
@@ -91,6 +116,8 @@ def open(
     path: _StrPath,
     mode: Literal["r", "w", "a", "rb", "wb", "ab"] = "r",
     level: int = 3,
+    *,
+    storage: _Storage = "auto",
 ) -> FspFile:
     """Open an FSP file and return a file object.
 
@@ -99,21 +126,25 @@ def open(
         mode: ``"r"`` read (default), ``"w"`` create/truncate, ``"a"``
             append. A trailing ``"b"`` is accepted and ignored.
         level: Default zstd level for writes on this file.
+        storage: Keyword-only default storage for writes: ``"auto"``,
+            ``"dense"`` or ``"sparse"``. Reading identifies each record's
+            encoding automatically, regardless of this write default.
 
     Returns:
         An :class:`FspFile`. Use it as a context manager where possible.
 
     Raises:
-        ValueError: For invalid modes or if the file cannot be opened.
+        ValueError: For invalid modes/storage or if the file cannot be opened.
     """
 
 @final
 class FspFile:
     """A file object for FSP1 streams, created by :func:`open`.
 
-    A file holds one or more concatenated FSP1 records. ``write`` appends one
-    array per call; ``read`` returns the next array, or ``None`` at end of
-    file. The object is iterable and works as a context manager::
+    A file holds one or more concatenated FSP1 records, which may mix dense
+    version 2 and sparse version 3. ``write`` appends one array per call;
+    ``read`` returns the next array, or ``None`` at end of file. The object is
+    iterable and works as a context manager::
 
         with fspcodec.open("frames.fsp", "w") as f:
             f.write(frame0)
@@ -138,16 +169,26 @@ class FspFile:
     def mode(self) -> Literal["r", "w", "a"]:
         """The normalized open mode."""
 
-    def write(self, array: npt.NDArray[np.float32], level: int | None = None) -> None:
+    def write(
+        self,
+        array: npt.NDArray[np.float32],
+        level: int | None = None,
+        *,
+        storage: _Storage | None = None,
+    ) -> None:
         """Append one float32 2-D array to the file.
 
         Args:
             array: 2-D ``float32`` array.
             level: Per-write zstd level override; defaults to the level
                 given to :func:`open`.
+            storage: Keyword-only per-write override (``"auto"``,
+                ``"dense"`` or ``"sparse"``). ``None`` inherits the mode
+                given to :func:`open`.
 
         Raises:
-            ValueError: If the file is closed or open for reading.
+            ValueError: If the file is closed, open for reading, or the
+                storage mode is invalid.
             TypeError: If the array is not 2-D float32.
         """
 

@@ -1,6 +1,6 @@
 [package]
 name = "fspcodec"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Lossless byte-planar zstd compression for float32 2-D arrays (depth maps)"
 license = "MIT"

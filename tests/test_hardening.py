@@ -23,7 +23,7 @@ def test_pathlib_paths_accepted(tmp_path):
 
 
 def _forged_header(h, w, plane_sizes):
-    hdr = b"FSP1" + bytes([1, 3, 0, 0])
+    hdr = b"FSP1" + bytes([2, 3, 0, 0])
     hdr += h.to_bytes(4, "little") + w.to_bytes(4, "little")
     for cs in plane_sizes:
         hdr += cs.to_bytes(4, "little")
